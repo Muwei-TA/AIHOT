@@ -12,10 +12,36 @@ import {
   type ReceiptRequest,
 } from "./receipts.ts";
 import { enterModelCircuit, recordModelHealth, type CircuitPermit } from "./circuit.ts";
+import { abandonAgentTask, agentEngineEnabled, enqueueAgentTask, takeAgentAnswer } from "./agent-tasks.ts";
 
 export interface ModelSpec extends ModelPreset {
   key: string;
 }
+
+/**
+ * AGENT_ENGINE=mcp: the `default` model's answers come from an MCP agent (Claude Code, Codex, any MCP
+ * client) through the reverse task queue in providers/agent-tasks.ts, instead of a hosted HTTP model.
+ * Nothing else changes: the same receipts, prompt versions and schemas apply, and no model key is needed.
+ */
+const agentEngine = agentEngineEnabled;
+
+/**
+ * The preset an agent answer is recorded under: its own service name keeps its receipts, budget and
+ * circuit apart from every hosted provider. It has no address and no key of its own (the agent reaches
+ * the queue through /api/mcp-engine, not through this struct), and it stays out of MODELS, which the
+ * admin's model page lists as selectable providers.
+ */
+const AGENT_SPEC: ModelSpec = {
+  key: "agent", service: "agent", model: "mcp-agent",
+  baseUrlEnv: "", apiKeyEnv: "",
+  jsonMode: true, vision: false,
+};
+
+/**
+ * How long the engine waits for an agent to answer. It stays under the receipts' 10-minute pending
+ * window (providers/receipts.ts): an answer that arrives later would be marked unknown and never used.
+ */
+const AGENT_TIMEOUT_MS = Math.min(540_000, Math.max(30_000, Math.floor(Number(process.env.AGENT_TASK_TIMEOUT_SECONDS) || 300) * 1000));
 
 function extraFromEnv(value: string | undefined): Record<string, unknown> | undefined {
   if (!value) return undefined;
@@ -164,6 +190,8 @@ async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit =
   const spec = MODELS[opts.model];
   if (!spec) throw new Error(`Unknown model ${opts.model}`);
   if (!config.modelCallsEnabled) throw new ModelUnavailableError("Model calls are disabled (MODEL_CALLS_ENABLED=false)");
+  // An MCP agent stands in for `default` only: a step explicitly routed to a hosted preset keeps calling it.
+  if (agentEngine() && spec.key === "default") return chatViaAgent(opts, circuit, fallbackFor);
   const baseUrl = credential("models", spec.baseUrlEnv);
   const apiKey = credential("models", spec.apiKeyEnv);
   if (!baseUrl || !apiKey || !spec.model) throw new ModelUnavailableError(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
@@ -240,4 +268,60 @@ async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit =
     throw new ModelOutputError(`Model ${opts.model} returned unusable output for ${opts.subject}: ${detail.slice(0, 300)}`, receipt.receiptId);
   }
   return { data: parsed, receiptId: receipt.receiptId, reused: receipt.reused, model: spec.key, usage: response.usage ?? null };
+}
+
+/**
+ * One prompt answered by an MCP agent. The receipt is claimed before the task is queued, so a replayed
+ * request reuses a stored answer and two workers cannot queue the same prompt twice. A wait that runs out
+ * is an outage (the agent turned the request away for now), not an unknown outcome: the task never left
+ * this deployment's database, so the next attempt queues a fresh one without a release.
+ */
+async function chatViaAgent<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit: boolean, fallbackFor?: string): Promise<ChatJsonResult<z.infer<S>>> {
+  const spec = AGENT_SPEC;
+  const { request } = requestFor(opts, spec);
+  const timeoutMs = opts.timeoutMs ?? AGENT_TIMEOUT_MS;
+  let permit: CircuitPermit;
+  // Images have no place in a text task: the agent gets the prompt it can act on.
+  const prompt = typeof opts.user === "string" ? opts.user : opts.user.map((part) => part.type === "text" ? part.text : "[image omitted]").join("\n");
+
+  const receipt = await paidRequest(
+    { ...request, fallbackFor },
+    async () => {
+      const started = performance.now();
+      const taskId = await enqueueAgentTask({ system: opts.system, prompt, jsonMode: spec.jsonMode && opts.json !== false });
+      let content: string;
+      try {
+        content = await takeAgentAnswer(taskId, timeoutMs);
+      } catch (error) {
+        // Nobody answered: drop the task so a late agent does not work for a receipt already marked failed.
+        await abandonAgentTask(taskId, String(error));
+        const timedOut = String(error).includes("timed out");
+        const failure = timedOut
+          ? new ProviderRejectedError(`agent did not answer within ${Math.round(timeoutMs / 1000)}s`, null, true)
+          : new ProviderRejectedError(`agent failed: ${String(error)}`, null, true);
+        if (circuit) await recordModelHealth(spec.service, permit!, true);
+        throw failure;
+      }
+      if (circuit) await recordModelHealth(spec.service, permit!, false);
+      // The agent's answer is wrapped like a chat completion, so the rest of this file reads it unchanged.
+      return {
+        response: { choices: [{ message: { content } }], _latencyMs: Math.round(performance.now() - started), _agentTaskId: taskId },
+        requestId: `agent-task-${taskId}`,
+        usage: null,
+        cost: null,
+      };
+    },
+    circuit ? async tx => { permit = await enterModelCircuit(tx, spec.service, timeoutMs); } : undefined,
+  );
+
+  const response = receipt.response as { choices?: Array<{ message?: { content?: string }; finish_reason?: string }> };
+  const content = response.choices?.[0]?.message?.content ?? "";
+  let parsed: z.infer<S>;
+  try {
+    parsed = opts.schema.parse(opts.parse ? opts.parse(content) : extractJson(content));
+  } catch (error) {
+    await rejectReceivedResponse(receipt.receiptId, `unusable output: ${String(error).slice(0, 500)}`);
+    throw new ModelOutputError(`Agent returned unusable output for ${opts.subject}: ${String(error).slice(0, 300)}`, receipt.receiptId);
+  }
+  return { data: parsed, receiptId: receipt.receiptId, reused: receipt.reused, model: spec.key, usage: null };
 }
